@@ -4,14 +4,13 @@
 #include "stdafx.h"
 #include "portfoward.h"
 
+
 #include "windows.h"
 #include "tchar.h"
 #include "stdio.h"
 #include "psapi.h"
 
 #include <MSWSock.h>// include after winsock2.h!
-
-
 
 #define MAX_LOADSTRING 100
 
@@ -20,6 +19,11 @@ HINSTANCE hInst;								// current instance
 TCHAR szTitle[MAX_LOADSTRING];					// The title bar text
 TCHAR szWindowClass[MAX_LOADSTRING];			// the main window class name
 HWND topWindow, status, redirs;
+
+TCHAR szInitialFile[MAX_PATH];
+
+//crossthreading
+CRITICAL_SECTION gui_cs;
 
 // Forward declarations of functions included in this code module:
 ATOM				MyRegisterClass(HINSTANCE hInstance);
@@ -33,10 +37,11 @@ int APIENTRY _tWinMain(HINSTANCE hInstance,
                      LPTSTR    lpCmdLine,
                      int       nCmdShow)
 {
+	dbgalloc(NULL);
 	UNREFERENCED_PARAMETER(hPrevInstance);
 	UNREFERENCED_PARAMETER(lpCmdLine);
 
- 	// TODO: Place code here.
+ 	
 	MSG msg;
 	HACCEL hAccelTable;
 
@@ -46,6 +51,8 @@ int APIENTRY _tWinMain(HINSTANCE hInstance,
  
 	wVersionRequested = MAKEWORD( 2, 2 );
  
+	InitializeCriticalSection(&gui_cs);
+
 	err = WSAStartup( wVersionRequested, &wsaData );
 	if ( err != 0 ) {
 		/* Tell the user that we could not find a usable */
@@ -53,6 +60,7 @@ int APIENTRY _tWinMain(HINSTANCE hInstance,
 		return 1;
 	}
 
+	_tcscpy(szInitialFile, lpCmdLine);
 	// Initialize global strings
 	LoadString(hInstance, IDS_APP_TITLE, szTitle, MAX_LOADSTRING);
 	LoadString(hInstance, IDC_PORTFOWARD, szWindowClass, MAX_LOADSTRING);
@@ -80,7 +88,8 @@ int APIENTRY _tWinMain(HINSTANCE hInstance,
 			DispatchMessage(&msg);
 		}
 	}
-
+	dbgfree();
+	DeleteCriticalSection(&gui_cs);
 	return (int) msg.wParam;
 }
 
@@ -429,6 +438,7 @@ typedef struct redir_info_t {
 	unsigned int dest;  // yeah, ipv4 only, sue me
 	int dport;
 	SOCKET s;
+	CRITICAL_SECTION cs;
 	std::set<conn_info*> connections;
 } redir_info;
 std::map<int, redir_info*> redir_infos;
@@ -598,7 +608,7 @@ bool delete_redir(int n)
 	closesocket(info->s);
 
 	redir_infos.erase(n);
-
+	DeleteCriticalSection(&info->cs);
 	delete info;
 
 	int count = ListView_GetItemCount(redirs);
@@ -647,31 +657,42 @@ void updateNumConnections(int idx)
 {
 	WCHAR bufW[100];
 	swprintf(bufW, 100, L"%d", redir_infos[idx]->connections.size());
+	EnterCriticalSection(&gui_cs);
 	ListView_SetItemText(redirs, idx, 3, bufW);
+	LeaveCriticalSection(&gui_cs);
 }
-
+void updateWndTxt(HWND hwnd,LPSTR szTxt)
+{
+	EnterCriticalSection(&gui_cs);
+	SetWindowTextA(hwnd, szTxt);
+	LeaveCriticalSection(&gui_cs);
+}
 DWORD WINAPI accepter(LPVOID lpThreadParameter)
 {
 	redir_info *info = redir_infos[(int)lpThreadParameter];
-
+	InitializeCriticalSection(&info->cs);
+	dbg_i("acc",("starting accepter %s",info->dest_host));
 	sockaddr_in sin;
 	int ss = sizeof(sin);
 	SOCKET n;
     while ((n = accept(info->s, (sockaddr*)&sin, &ss)) != -1) {
 		char buf[1024];
         sprintf(buf, "received connection from %i.%i.%i.%i on port %i\n", sin.sin_addr.S_un.S_un_b.s_b1, sin.sin_addr.S_un.S_un_b.s_b2, sin.sin_addr.S_un.S_un_b.s_b3, sin.sin_addr.S_un.S_un_b.s_b4, info->lport);
-		SetWindowTextA(status, buf);
+		updateWndTxt(status, buf);
+		dbg_i("acc",("received connection from %i.%i.%i.%i on port %i", sin.sin_addr.S_un.S_un_b.s_b1, sin.sin_addr.S_un.S_un_b.s_b2, sin.sin_addr.S_un.S_un_b.s_b3, sin.sin_addr.S_un.S_un_b.s_b4, info->lport));
         SOCKET d = socket(AF_INET, SOCK_STREAM, 0);
         sin.sin_family = AF_INET;
         sin.sin_addr.S_un.S_addr = info->dest;
         sin.sin_port = htons(info->dport);
         if (connect(d, (sockaddr*)&sin, sizeof(sin)) != 0) {
             sprintf(buf, "received a connection but can't connect to %s:%i\n", info->dest_host, info->dport);
-			SetWindowTextA(status, buf);
+			updateWndTxt(status, buf);
+			dbg_i("acc",("received a connection but can't connect to %s:%i", info->dest_host, info->dport));
             closesocket(n);
         } else {
             sprintf(buf, "connection to %s:%i established\n", info->dest_host, info->dport);
-			SetWindowTextA(status, buf);
+			updateWndTxt(status, buf);
+			dbg_i("acc",("connection to %s:%i established", info->dest_host, info->dport));
 			conn_info *cinfo = new conn_info;
 			cinfo->info = info;
 			cinfo->dest_host = info->dest_host;
@@ -695,16 +716,15 @@ DWORD WINAPI accepter(LPVOID lpThreadParameter)
 }
 
 DWORD WINAPI reader(LPVOID lpThreadParameter)
-{   // reads data from client and forwards it to the destination
+{
 	conn_info *ci = (conn_info*)lpThreadParameter;
 
     char buf[65536];
     int n;
-    // recv data from the client and forward it to destination
     while ((n = recv(ci->n, buf, sizeof(buf), 0)) > 0 && !ci->stop) {
         send(ci->d, buf, n, 0);
     }
-
+	dbg_i("rdr",("closing in and out sockets"));
     betterCloseSocket(ci->n);
     betterCloseSocket(ci->d);
 
@@ -712,20 +732,22 @@ DWORD WINAPI reader(LPVOID lpThreadParameter)
 		Sleep(10);
 
 	ci->stopped = true;
-
+	dbg_i("rdr",("clean up (ci->stop=%d)",ci->stop));
 	// told to stop
 	if (ci->stop)
 		return 0;
 
 	// otherwise, cleanup
 	if (ci->info) {
+		EnterCriticalSection(&ci->info->cs);
 		ci->info->connections.erase(ci);
+		LeaveCriticalSection(&ci->info->cs);
 		updateNumConnections(ci->info->idx);
 	}
 
-	sprintf(buf, "connection to %s:%i closed\n", ci->dest_host, ci->dport);
-	SetWindowTextA(status, buf);
-
+	//sprintf(buf, "connection to %s:%i closed\n", ci->dest_host, ci->dport);
+	//SetWindowTextA(status, buf);
+	dbg_i("rdr",("connection to %s:%i closed", ci->dest_host, ci->dport));
 	delete ci;
 
 	return 0;
@@ -741,7 +763,7 @@ DWORD WINAPI writer(LPVOID lpThreadParameter)
         send(ci->n, buf, n, 0);
     }
 
-    
+    //closesocket(ci->n);
     betterCloseSocket(ci->n);
     betterCloseSocket(ci->d);
 
@@ -769,8 +791,9 @@ void loadDefaultForwards(void) {
     if (!GetModuleFileNameEx(Handle, 0, Buffer, MAX_PATH)) return;
 
     TCHAR *lastSlash = wcsrchr(Buffer,'\\');
-    if(!lastSlash) return;
-    wcsncpy(lastSlash+1,L"portforward.config.txt",23);
+    if(!lastSlash) 
+		return;
+    wcsncpy(lastSlash + 1, szInitialFile, 23);
 
     
     FILE *f = _wfopen(Buffer,L"r");

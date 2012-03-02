@@ -1,1 +1,8 @@
-Initial readme
+History
+
+v1.1
+Upstream project was forked. 
+Added logging support
+Critical bug was fixed (app hanged up when concurrent threads accesses the data)
+Command line initial file name passing was added
+Project files were converted to Visual 2010
